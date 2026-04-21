@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, TypedDict
+from typing import Final, Literal, TypedDict
 
 import torch
 import torch.nn as nn
@@ -22,13 +23,13 @@ class TrainConfig:
     output_preview_path: Path = Path(__file__).resolve().parent / "vae_faces_samples.png"
     output_recon_path: Path = Path(__file__).resolve().parent / "vae_faces_reconstructions.png"
     image_size: int = 64
-    latent_dim: int = 96
+    latent_dim: int = 128
     batch_size: int = 64
-    epochs: int = 20
+    epochs: int = 60
     learning_rate: float = 4e-4
-    beta_kl_max: float = 0.004
-    warmup_epochs: int = 8
-    num_workers: int = 0  # Windows friendly
+    beta_kl_max: float = 0.002
+    warmup_epochs: int = 12
+    num_workers: int = max(2, min(8, os.cpu_count() or 2))
     seed: int = 42
 
 
@@ -38,6 +39,9 @@ class Checkpoint(TypedDict):
     latent_dim: int
     image_size: int
     last_epoch: int
+
+
+DeviceArg = Literal["auto", "cpu", "cuda"]
 
 
 class FaceImageDataset(Dataset[torch.Tensor]):
@@ -61,6 +65,7 @@ class FaceImageDataset(Dataset[torch.Tensor]):
                 transforms.CenterCrop(image_size),
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.ToTensor(),
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
             ]
         )
 
@@ -70,6 +75,8 @@ class FaceImageDataset(Dataset[torch.Tensor]):
     def __getitem__(self, index: int) -> torch.Tensor:
         path = self.image_paths[index]
         with Image.open(path) as image:
+            if image.mode == "P" and "transparency" in image.info:
+                image = image.convert("RGBA")
             rgb_image = ImageOps.exif_transpose(image).convert("RGB")
         return self.transform(rgb_image)
 
@@ -102,7 +109,7 @@ class VAE(nn.Module):
             nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),   # 16 -> 32
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(32, 3, kernel_size=4, stride=2, padding=1),    # 32 -> 64
-            nn.Sigmoid(),
+            nn.Tanh(),
         )
 
     def encode(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -135,11 +142,15 @@ def loss_function(
     return total_loss, reconstruction_loss, kl_div
 
 
+def denormalize(images: torch.Tensor) -> torch.Tensor:
+    return ((images + 1.0) * 0.5).clamp(0.0, 1.0)
+
+
 def save_preview_images(model: VAE, device: torch.device, config: TrainConfig) -> None:
     model.eval()
     with torch.inference_mode():
         latent = torch.randn(16, config.latent_dim, device=device)
-        samples = model.decode(latent).cpu().clamp(0.0, 1.0)
+        samples = denormalize(model.decode(latent).cpu())
         grid = make_grid(samples, nrow=4)
         save_image(grid, config.output_preview_path)
 
@@ -151,8 +162,8 @@ def save_reconstruction_preview(
     with torch.inference_mode():
         batch = next(iter(dataloader)).to(device)
         recon, _, _ = model(batch[:8])
-        originals = batch[:8].cpu()
-        reconstructions = recon.cpu().clamp(0.0, 1.0)
+        originals = denormalize(batch[:8].cpu())
+        reconstructions = denormalize(recon.cpu())
         comparison = torch.cat([originals, reconstructions], dim=0)
         grid = make_grid(comparison, nrow=8)
         save_image(grid, output_path)
@@ -181,22 +192,44 @@ def load_checkpoint_if_available(model: VAE, optimizer: torch.optim.Optimizer, p
     return max(last_epoch, 0)
 
 
-def train(config: TrainConfig, resume: bool) -> None:
+def resolve_device(device_arg: DeviceArg) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA demandee mais indisponible. Verifie les drivers/CUDA Toolkit.")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def train(config: TrainConfig, resume: bool, device_arg: DeviceArg) -> None:
     torch.manual_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(device_arg)
+    use_amp = device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     dataset = FaceImageDataset(config.data_dir, config.image_size)
+    loader_kwargs: dict[str, object] = {}
+    if config.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+        loader_kwargs["persistent_workers"] = True
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=device.type == "cuda",
+        **loader_kwargs,
     )
 
     model = VAE(config.latent_dim).to(device)
+    if device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last)
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate, betas=(0.9, 0.999))
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config.epochs, eta_min=1e-4)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     start_epoch = load_checkpoint_if_available(model, optimizer, config.output_model_path) if resume else 0
 
     print(
@@ -213,15 +246,16 @@ def train(config: TrainConfig, resume: bool) -> None:
         beta = current_beta(epoch, config)
 
         for batch in dataloader:
-            images = batch.to(device)
-            reconstructed, mu, log_var = model(images)
-            loss, reconstruction_loss, kl_div = loss_function(
-                reconstructed, images, mu, log_var, beta
-            )
-
+            images = batch.to(device, non_blocking=device.type == "cuda").contiguous(memory_format=torch.channels_last)
             optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                reconstructed, mu, log_var = model(images)
+                loss, reconstruction_loss, kl_div = loss_function(
+                    reconstructed, images, mu, log_var, beta
+                )
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
 
             loss_accumulator += loss.item()
             recon_accumulator += reconstruction_loss.item()
@@ -258,8 +292,15 @@ def train(config: TrainConfig, resume: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entrainement VAE sur dataset de visages")
-    parser.add_argument("--epochs", type=int, default=20, help="Nombre d'epoques")
+    parser.add_argument("--epochs", type=int, default=60, help="Nombre d'epoques")
     parser.add_argument("--batch-size", type=int, default=64, help="Taille de batch")
+    parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers, help="Workers DataLoader")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device d'entrainement (auto=CUDA si disponible)",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -270,4 +311,8 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    train(TrainConfig(epochs=args.epochs, batch_size=args.batch_size), resume=args.resume)
+    train(
+        TrainConfig(epochs=args.epochs, batch_size=args.batch_size, num_workers=args.num_workers),
+        resume=args.resume,
+        device_arg=args.device,
+    )
