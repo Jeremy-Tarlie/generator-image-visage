@@ -12,7 +12,7 @@ from PIL import Image
 
 from .model import GeneratorService
 
-CHECKPOINT_FILENAME: Final[str] = "vae_faces.pt"
+CHECKPOINT_FILENAME: Final[str] = "gan_faces.pt"
 CHECKPOINT_PATH: Final[Path] = Path(__file__).resolve().parents[1] / "generation_model" / CHECKPOINT_FILENAME
 
 
