@@ -1,9 +1,0 @@
-numpy
-matplotlib
-torch
-torchvision
-transformers
-forward
-fastapi
-uvicorn
-pillow

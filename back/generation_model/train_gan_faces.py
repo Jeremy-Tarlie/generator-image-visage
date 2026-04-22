@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
+from typing import Literal, TypedDict
 
 import torch
 import torch.nn as nn
@@ -20,11 +21,11 @@ class TrainConfig:
     output_model_path: Path = Path(__file__).resolve().parent / "gan_faces.pt"
     output_preview_path: Path = Path(__file__).resolve().parent / "gan_faces_samples.png"
     image_size: int = 64
-    latent_dim: int = 96
+    latent_dim: int = 128
     batch_size: int = 64
-    epochs: int = 20
+    epochs: int = 80
     learning_rate: float = 2e-4
-    num_workers: int = 0
+    num_workers: int = max(2, min(8, os.cpu_count() or 2))
     seed: int = 42
 
 
@@ -36,6 +37,9 @@ class GANCheckpoint(TypedDict):
     latent_dim: int
     image_size: int
     last_epoch: int
+
+
+DeviceArg = Literal["auto", "cpu", "cuda"]
 
 
 class FaceImageDataset(Dataset[torch.Tensor]):
@@ -67,6 +71,8 @@ class FaceImageDataset(Dataset[torch.Tensor]):
     def __getitem__(self, index: int) -> torch.Tensor:
         path = self.image_paths[index]
         with Image.open(path) as image:
+            if image.mode == "P" and "transparency" in image.info:
+                image = image.convert("RGBA")
             rgb_image = ImageOps.exif_transpose(image).convert("RGB")
         return self.transform(rgb_image)
 
@@ -128,6 +134,16 @@ def denormalize(images: torch.Tensor) -> torch.Tensor:
     return ((images + 1.0) * 0.5).clamp(0.0, 1.0)
 
 
+def resolve_device(device_arg: DeviceArg) -> torch.device:
+    if device_arg == "cpu":
+        return torch.device("cpu")
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA demandee mais indisponible. Verifie les drivers/CUDA Toolkit.")
+        return torch.device("cuda")
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def load_checkpoint_if_available(
     generator: Generator,
     discriminator: Discriminator,
@@ -168,11 +184,19 @@ def save_samples(generator: Generator, latent_dim: int, device: torch.device, ou
         save_image(grid, output_path)
 
 
-def train(config: TrainConfig, resume: bool) -> None:
+def train(config: TrainConfig, resume: bool, device_arg: DeviceArg) -> None:
     torch.manual_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = resolve_device(device_arg)
+    use_amp = device.type == "cuda"
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.set_float32_matmul_precision("high")
 
     dataset = FaceImageDataset(config.data_dir, config.image_size)
+    loader_kwargs: dict[str, object] = {}
+    if config.num_workers > 0:
+        loader_kwargs["prefetch_factor"] = 4
+        loader_kwargs["persistent_workers"] = True
     dataloader = DataLoader(
         dataset,
         batch_size=config.batch_size,
@@ -180,10 +204,14 @@ def train(config: TrainConfig, resume: bool) -> None:
         num_workers=config.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
+        **loader_kwargs,
     )
 
     generator = Generator(config.latent_dim).to(device)
     discriminator = Discriminator().to(device)
+    if device.type == "cuda":
+        generator = generator.to(memory_format=torch.channels_last)
+        discriminator = discriminator.to(memory_format=torch.channels_last)
     generator.apply(init_weights)
     discriminator.apply(init_weights)
     criterion = nn.BCEWithLogitsLoss()
@@ -191,6 +219,8 @@ def train(config: TrainConfig, resume: bool) -> None:
 
     optimizer_g = torch.optim.Adam(generator.parameters(), lr=config.learning_rate, betas=(0.5, 0.999))
     optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=config.learning_rate * 0.5, betas=(0.5, 0.999))
+    scaler_g = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler_d = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_epoch = (
         load_checkpoint_if_available(
@@ -212,35 +242,42 @@ def train(config: TrainConfig, resume: bool) -> None:
         g_epoch_loss = 0.0
 
         for real_images in dataloader:
-            real_images = real_images.to(device)
+            real_images = real_images.to(
+                device, non_blocking=device.type == "cuda"
+            ).contiguous(memory_format=torch.channels_last)
             current_batch_size = real_images.size(0)
 
             real_targets = torch.full((current_batch_size, 1), 0.9, device=device)
             fake_targets = torch.zeros(current_batch_size, 1, device=device)
 
             z = torch.randn(current_batch_size, config.latent_dim, 1, 1, device=device)
-            fake_images = generator(z)
-
             optimizer_d.zero_grad()
-            d_real = criterion(discriminator(real_images), real_targets)
-            d_fake = criterion(discriminator(fake_images.detach()), fake_targets)
-            d_loss = 0.5 * (d_real + d_fake)
-            d_loss.backward()
-            optimizer_d.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                fake_images = generator(z)
+                d_real = criterion(discriminator(real_images), real_targets)
+                d_fake = criterion(discriminator(fake_images.detach()), fake_targets)
+                d_loss = 0.5 * (d_real + d_fake)
+            scaler_d.scale(d_loss).backward()
+            scaler_d.step(optimizer_d)
+            scaler_d.update()
 
             optimizer_g.zero_grad()
             g_targets = torch.ones(current_batch_size, 1, device=device)
-            g_loss = criterion(discriminator(fake_images), g_targets)
-            g_loss.backward()
-            optimizer_g.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                g_loss = criterion(discriminator(fake_images), g_targets)
+            scaler_g.scale(g_loss).backward()
+            scaler_g.step(optimizer_g)
+            scaler_g.update()
 
             # 2e update du generateur pour aider a converger en peu d'epochs.
             z2 = torch.randn(current_batch_size, config.latent_dim, 1, 1, device=device)
-            fake_images2 = generator(z2)
             optimizer_g.zero_grad()
-            g_loss_2 = criterion(discriminator(fake_images2), g_targets)
-            g_loss_2.backward()
-            optimizer_g.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                fake_images2 = generator(z2)
+                g_loss_2 = criterion(discriminator(fake_images2), g_targets)
+            scaler_g.scale(g_loss_2).backward()
+            scaler_g.step(optimizer_g)
+            scaler_g.update()
 
             d_epoch_loss += d_loss.item()
             g_epoch_loss += 0.5 * (g_loss.item() + g_loss_2.item())
@@ -273,8 +310,15 @@ def train(config: TrainConfig, resume: bool) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entrainement GAN sur dataset de visages")
-    parser.add_argument("--epochs", type=int, default=20, help="Nombre d'epoques")
+    parser.add_argument("--epochs", type=int, default=80, help="Nombre d'epoques")
     parser.add_argument("--batch-size", type=int, default=64, help="Taille de batch")
+    parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers, help="Workers DataLoader")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="Device d'entrainement (auto=CUDA si disponible)",
+    )
     parser.add_argument(
         "--resume",
         action="store_true",
@@ -285,4 +329,8 @@ def parse_args() -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
-    train(TrainConfig(epochs=args.epochs, batch_size=args.batch_size), resume=args.resume)
+    train(
+        TrainConfig(epochs=args.epochs, batch_size=args.batch_size, num_workers=args.num_workers),
+        resume=args.resume,
+        device_arg=args.device,
+    )
