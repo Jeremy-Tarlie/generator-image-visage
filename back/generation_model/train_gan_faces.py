@@ -26,6 +26,9 @@ class TrainConfig:
     epochs: int = 160
     learning_rate: float = 2e-4
     ema_decay: float = 0.999
+    d_steps: int = 2
+    r1_gamma: float = 10.0
+    r1_interval: int = 16
     num_workers: int = max(2, min(8, os.cpu_count() or 2))
     seed: int = 42
 
@@ -150,6 +153,62 @@ def update_ema(ema_model: nn.Module, current_model: nn.Module, decay: float) -> 
             ema_param.lerp_(model_param, 1.0 - decay)
 
 
+def random_brightness(images: torch.Tensor, strength: float = 0.2) -> torch.Tensor:
+    delta = (torch.rand(images.size(0), 1, 1, 1, device=images.device) - 0.5) * 2.0 * strength
+    return images + delta
+
+
+def random_saturation(images: torch.Tensor, strength: float = 0.5) -> torch.Tensor:
+    image_mean = images.mean(dim=1, keepdim=True)
+    scale = 1.0 + (torch.rand(images.size(0), 1, 1, 1, device=images.device) - 0.5) * 2.0 * strength
+    return (images - image_mean) * scale + image_mean
+
+
+def random_translation(images: torch.Tensor, ratio: float = 0.125) -> torch.Tensor:
+    batch, _, height, width = images.shape
+    shift_x = int(height * ratio + 0.5)
+    shift_y = int(width * ratio + 0.5)
+    if shift_x < 1 and shift_y < 1:
+        return images
+
+    padded = torch.nn.functional.pad(images, (shift_y, shift_y, shift_x, shift_x), mode="reflect")
+    translation_x = torch.randint(-shift_x, shift_x + 1, (batch,), device=images.device)
+    translation_y = torch.randint(-shift_y, shift_y + 1, (batch,), device=images.device)
+    translated = torch.empty_like(images)
+
+    for index in range(batch):
+        x0 = shift_x + int(translation_x[index].item())
+        y0 = shift_y + int(translation_y[index].item())
+        translated[index] = padded[index, :, x0 : x0 + height, y0 : y0 + width]
+    return translated
+
+
+def random_cutout(images: torch.Tensor, ratio: float = 0.3) -> torch.Tensor:
+    batch, _, height, width = images.shape
+    cutout_h = max(1, int(height * ratio))
+    cutout_w = max(1, int(width * ratio))
+    center_x = torch.randint(0, height, (batch,), device=images.device)
+    center_y = torch.randint(0, width, (batch,), device=images.device)
+    masked = images.clone()
+
+    for index in range(batch):
+        x0 = max(0, int(center_x[index].item()) - cutout_h // 2)
+        x1 = min(height, x0 + cutout_h)
+        y0 = max(0, int(center_y[index].item()) - cutout_w // 2)
+        y1 = min(width, y0 + cutout_w)
+        masked[index, :, x0:x1, y0:y1] = 0.0
+    return masked
+
+
+def diff_augment(images: torch.Tensor) -> torch.Tensor:
+    # Augmentations differentiables pour stabiliser l'apprentissage sur petits datasets.
+    augmented = random_brightness(images)
+    augmented = random_saturation(augmented)
+    augmented = random_translation(augmented)
+    augmented = random_cutout(augmented)
+    return augmented
+
+
 def resolve_device(device_arg: DeviceArg) -> torch.device:
     if device_arg == "cpu":
         return torch.device("cpu")
@@ -260,6 +319,12 @@ def train(config: TrainConfig, resume: bool, device_arg: DeviceArg) -> None:
         flush=True,
     )
 
+    if config.r1_interval < 1:
+        raise ValueError("r1_interval doit etre >= 1")
+    if config.d_steps < 1:
+        raise ValueError("d_steps doit etre >= 1")
+
+    global_step = 0
     for epoch in range(start_epoch + 1, config.epochs + 1):
         generator.train()
         discriminator.train()
@@ -272,22 +337,42 @@ def train(config: TrainConfig, resume: bool, device_arg: DeviceArg) -> None:
             ).contiguous(memory_format=torch.channels_last)
             current_batch_size = real_images.size(0)
 
-            z = torch.randn(current_batch_size, config.latent_dim, 1, 1, device=device)
-            optimizer_d.zero_grad(set_to_none=True)
-            with torch.amp.autocast("cuda", enabled=use_amp):
-                fake_images = generator(z)
-                d_real_logits = discriminator(real_images)
-                d_fake_logits = discriminator(fake_images.detach())
-                d_loss = discriminator_hinge_loss(d_real_logits, d_fake_logits)
-            scaler_d.scale(d_loss).backward()
-            scaler_d.step(optimizer_d)
-            scaler_d.update()
+            d_loss = torch.zeros((), device=device)
+            for _ in range(config.d_steps):
+                global_step += 1
+                z = torch.randn(current_batch_size, config.latent_dim, 1, 1, device=device)
+                optimizer_d.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    fake_images = generator(z)
+                    d_real_logits = discriminator(diff_augment(real_images))
+                    d_fake_logits = discriminator(diff_augment(fake_images.detach()))
+                    d_loss = discriminator_hinge_loss(d_real_logits, d_fake_logits)
+                scaler_d.scale(d_loss).backward()
+                scaler_d.step(optimizer_d)
+                scaler_d.update()
+
+                if global_step % config.r1_interval == 0:
+                    optimizer_d.zero_grad(set_to_none=True)
+                    real_for_r1 = real_images.detach().requires_grad_(True)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        r1_logits = discriminator(real_for_r1)
+                    r1_grads = torch.autograd.grad(
+                        outputs=r1_logits.sum(),
+                        inputs=real_for_r1,
+                        create_graph=True,
+                        only_inputs=True,
+                    )[0]
+                    r1_penalty = r1_grads.square().flatten(1).sum(dim=1).mean()
+                    r1_loss = 0.5 * config.r1_gamma * r1_penalty
+                    scaler_d.scale(r1_loss).backward()
+                    scaler_d.step(optimizer_d)
+                    scaler_d.update()
 
             optimizer_g.zero_grad(set_to_none=True)
             z_g = torch.randn(current_batch_size, config.latent_dim, 1, 1, device=device)
             with torch.amp.autocast("cuda", enabled=use_amp):
                 fake_for_g = generator(z_g)
-                g_loss = generator_hinge_loss(discriminator(fake_for_g))
+                g_loss = generator_hinge_loss(discriminator(diff_augment(fake_for_g)))
             scaler_g.scale(g_loss).backward()
             scaler_g.step(optimizer_g)
             scaler_g.update()
@@ -325,9 +410,12 @@ def train(config: TrainConfig, resume: bool, device_arg: DeviceArg) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Entrainement GAN sur dataset de visages")
-    parser.add_argument("--epochs", type=int, default=160, help="Nombre d'epoques")
+    parser.add_argument("--epochs", type=int, default=300, help="Nombre d'epoques")
     parser.add_argument("--batch-size", type=int, default=64, help="Taille de batch")
     parser.add_argument("--num-workers", type=int, default=TrainConfig.num_workers, help="Workers DataLoader")
+    parser.add_argument("--d-steps", type=int, default=2, help="Nombre de mises a jour D par mise a jour G")
+    parser.add_argument("--r1-gamma", type=float, default=10.0, help="Force de la regularisation R1")
+    parser.add_argument("--r1-interval", type=int, default=16, help="Frequence (en steps D) de R1")
     parser.add_argument(
         "--device",
         choices=("auto", "cpu", "cuda"),
@@ -345,7 +433,14 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     train(
-        TrainConfig(epochs=args.epochs, batch_size=args.batch_size, num_workers=args.num_workers),
+        TrainConfig(
+            epochs=args.epochs,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            d_steps=args.d_steps,
+            r1_gamma=args.r1_gamma,
+            r1_interval=args.r1_interval,
+        ),
         resume=args.resume,
         device_arg=args.device,
     )
